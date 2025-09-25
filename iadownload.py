@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from enum import Enum
 import re
 
 try:
@@ -26,9 +27,17 @@ except ImportError:
 console = Console() if RICH_AVAILABLE else None
 
 
+class OverwriteAction(Enum):
+    SKIP = "skip"
+    OVERWRITE = "overwrite"
+    SKIP_ALL = "skip_all"
+    OVERWRITE_ALL = "overwrite_all"
+
+
 class IADownloader:
     def __init__(self):
         self.error_log = []
+        self.overwrite_action = None  # Will store OverwriteAction for "all" choices
         
     def format_file_size(self, bytes_size: int) -> str:
         """Format file size in human readable format"""
@@ -167,6 +176,49 @@ class IADownloader:
             self.print_colored(f"Command output: {e.stderr if e.stderr else 'No error output'}", "red")
             return []
     
+    def prompt_overwrite_action(self, filename: str, progress=None, task=None) -> OverwriteAction:
+        """Prompt user for overwrite action when file exists"""
+        # Pause progress display if provided
+        if progress and task is not None:
+            progress.stop()
+        
+        # Clear line and move to new line for clean prompt display
+        print("\r" + " " * 80)  # Clear current line
+        print(f"\nFile already exists: {filename}")
+        print("Choose an action:")
+        print("1. Skip this file (default)")
+        print("2. Overwrite this file")
+        print("3. Skip all remaining files")
+        print("4. Overwrite all remaining files")
+        print()
+        
+        while True:
+            choice = input("Enter your choice (1-4, default 1): ").strip()
+            if not choice:
+                choice = "1"
+            if choice in ["1", "2", "3", "4"]:
+                break
+            print("Please enter 1, 2, 3, or 4.")
+        
+        # Resume progress display if provided
+        if progress and task is not None:
+            progress.start()
+        
+        action_map = {
+            "1": OverwriteAction.SKIP,
+            "2": OverwriteAction.OVERWRITE,
+            "3": OverwriteAction.SKIP_ALL,
+            "4": OverwriteAction.OVERWRITE_ALL
+        }
+        
+        action = action_map[choice]
+        
+        # Store "all" actions for future use
+        if action in [OverwriteAction.SKIP_ALL, OverwriteAction.OVERWRITE_ALL]:
+            self.overwrite_action = action
+            
+        return action
+
     def get_item_metadata(self, item_id: str) -> Optional[Dict[str, Any]]:
         """Get metadata for a specific item"""
         try:
@@ -303,7 +355,7 @@ class IADownloader:
                 task = progress.add_task("Downloading", total=len(item_list))
                 
                 for item_id in item_list:
-                    self._process_item_download(item_id, download_dir, all_metadata)
+                    self._process_item_download(item_id, download_dir, all_metadata, progress, task)
                     progress.advance(task)
         else:
             for i, item_id in enumerate(item_list, 1):
@@ -333,54 +385,102 @@ class IADownloader:
         else:
             self.print_colored("No items were successfully processed or downloaded.", "red")
     
-    def _process_item_download(self, item_id: str, download_dir: str, all_metadata: List[Dict]):
+    def _process_item_download(self, item_id: str, download_dir: str, all_metadata: List[Dict], progress=None, task=None):
         """Process download for a single item"""
         try:
-            # Get metadata first
+            # Get metadata first to know what files we would download
             metadata = self.get_item_metadata(item_id)
             if not metadata:
                 self.error_log.append(f"Failed to get metadata for item: {item_id}")
                 return
             
-            # Download PDFs to temporary subfolder
-            subprocess.run(
-                ["ia", "download", item_id, "--glob=*.pdf"],
-                cwd=os.getcwd(),
-                capture_output=True,
-                check=True
-            )
+            # Check what PDF files would be downloaded and if they exist
+            potential_pdf_files = [f.get('name', '') for f in metadata.get('files', []) if f.get('name', '').endswith('.pdf')]
             
-            # Check if temp directory was created
-            item_subdir = os.path.join(os.getcwd(), item_id)
-            if os.path.exists(item_subdir):
-                # Find downloaded PDFs
-                pdf_files = [f for f in os.listdir(item_subdir) if f.endswith('.pdf')]
+            # ALWAYS create metadata entries for all potential PDF files
+            # This ensures we capture metadata for every item and every file
+            for pdf_file in potential_pdf_files:
+                metadata_entry = {
+                    'ItemID': item_id,
+                    'FileName': pdf_file,
+                    'title': metadata.get('metadata', {}).get('title', ''),
+                    'creator': metadata.get('metadata', {}).get('creator', ''),
+                    'publisher': metadata.get('metadata', {}).get('publisher', ''),
+                    'date': metadata.get('metadata', {}).get('date', ''),
+                    'subject': metadata.get('metadata', {}).get('subject', ''),
+                    'language': metadata.get('metadata', {}).get('language', ''),
+                    'description': metadata.get('metadata', {}).get('description', ''),
+                    'call_number': metadata.get('metadata', {}).get('call number', '')
+                }
+                all_metadata.append(metadata_entry)
+            
+            # If no PDFs, we still captured the metadata, so return
+            if not potential_pdf_files:
+                return
+            
+            # If user selected "Skip All", don't download anything but metadata is already captured
+            if self.overwrite_action == OverwriteAction.SKIP_ALL:
+                return
+            
+            # Check for conflicts before downloading anything
+            files_to_skip = []
+            should_download = False  # Track if we should download anything
+            
+            for pdf_file in potential_pdf_files:
+                dst = os.path.join(download_dir, pdf_file)
+                if os.path.exists(dst):
+                    if self.overwrite_action == OverwriteAction.SKIP_ALL:
+                        files_to_skip.append(pdf_file)
+                    elif self.overwrite_action == OverwriteAction.OVERWRITE_ALL:
+                        should_download = True
+                    else:
+                        # Prompt user for action
+                        action = self.prompt_overwrite_action(pdf_file, progress, task)
+                        
+                        if action == OverwriteAction.SKIP:
+                            files_to_skip.append(pdf_file)
+                        elif action == OverwriteAction.SKIP_ALL:
+                            # Skip this file and all future ones
+                            files_to_skip.append(pdf_file)
+                            return  # Exit early, don't process any more items
+                        else:  # OVERWRITE or OVERWRITE_ALL
+                            should_download = True
+                else:
+                    should_download = True  # New file, always download
+            
+            # If all files would be skipped, we still have metadata but no files to download
+            if len(files_to_skip) == len(potential_pdf_files):
+                return
+            
+            # If we have at least one file to process, download the item
+            if should_download or len(files_to_skip) < len(potential_pdf_files):
+                # Download PDFs to temporary subfolder
+                subprocess.run(
+                    ["ia", "download", item_id, "--glob=*.pdf"],
+                    cwd=os.getcwd(),
+                    capture_output=True,
+                    check=True
+                )
                 
-                if pdf_files:
-                    # Create metadata entries for each PDF
-                    for pdf_file in pdf_files:
-                        metadata_entry = {
-                            'ItemID': item_id,
-                            'FileName': pdf_file,
-                            'title': metadata.get('metadata', {}).get('title', ''),
-                            'creator': metadata.get('metadata', {}).get('creator', ''),
-                            'publisher': metadata.get('metadata', {}).get('publisher', ''),
-                            'date': metadata.get('metadata', {}).get('date', ''),
-                            'subject': metadata.get('metadata', {}).get('subject', ''),
-                            'language': metadata.get('metadata', {}).get('language', ''),
-                            'description': metadata.get('metadata', {}).get('description', ''),
-                            'call_number': metadata.get('metadata', {}).get('call number', '')
-                        }
-                        all_metadata.append(metadata_entry)
+                # Check if temp directory was created
+                item_subdir = os.path.join(os.getcwd(), item_id)
+                if os.path.exists(item_subdir):
+                    # Find downloaded PDFs
+                    pdf_files = [f for f in os.listdir(item_subdir) if f.endswith('.pdf')]
                     
-                    # Move PDFs to final destination
-                    for pdf_file in pdf_files:
-                        src = os.path.join(item_subdir, pdf_file)
-                        dst = os.path.join(download_dir, pdf_file)
-                        shutil.move(src, dst)
-                
-                # Cleanup temp directory
-                shutil.rmtree(item_subdir, ignore_errors=True)
+                    if pdf_files:
+                        # Move PDFs to final destination
+                        for pdf_file in pdf_files:
+                            # Skip files that user chose to skip
+                            if pdf_file in files_to_skip:
+                                continue
+                                
+                            src = os.path.join(item_subdir, pdf_file)
+                            dst = os.path.join(download_dir, pdf_file)
+                            shutil.move(src, dst)
+                    
+                    # Cleanup temp directory
+                    shutil.rmtree(item_subdir, ignore_errors=True)
                 
         except Exception as e:
             self.error_log.append(f"Failed to process item: {item_id}. Error: {e}")
