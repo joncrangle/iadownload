@@ -1,0 +1,19 @@
+[project]
+name = "iadownload"
+version = "1.0.0"
+description = "Internet Archive PDF download script with metadata collection"
+authors = [
+    {name = "Internet Archive Downloader"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "internetarchive>=3.0.0",
+    "rich>=13.0.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+reportUnknownMemberType = false
